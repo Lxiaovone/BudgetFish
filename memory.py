@@ -59,6 +59,86 @@ MAX_CONTENT = 2000
 MAX_FILE_CHARS = 700
 MAX_CONTEXT_CHARS = 1500
 
+# ---------------------------- V6 双轨打分（2026-11-13 从真机 v6_memory_gate 对齐） ----------------------------
+# 老版是「7 天转模糊、30 天归档」，靠文件 mtime 判生死：一句话说过一次就死，
+# 说过十次也死，人和机器都看不出区别。V6 改成两条轨：
+#   fast 短期热度（封顶 40，命中和曝光会涨，衰减快）
+#   slow 长期沉淀（每次命中 +1，衰减慢，能扛住一段时间没人提）
+# 规则：real = fast + slow；real<=0 判死（墓碑，进归档）；0<real<25 判模糊（注入时加不确定前缀）。
+FAST_CAP = 40.0
+INIT_FAST = 40.0
+INIT_SLOW = 3.0
+INIT_SLOW_EMOTION = 8.0
+FUZZY_HIGH = 25.0
+HIT_FAST = 10.0
+HIT_SLOW = 1.0
+FAST_DECAY_RATE = 0.8
+FAST_SUB_FLOOR = 5.0
+FAST_SUB_STEP = 2.0
+SLOW_DECAY_STEP = 1.0
+ZERO_EPS = 0.5
+MAX_CATCHUP_DAYS = 14
+MAX_KILL_RATIO = 0.30
+SLOW_DEDUP_SEC = 1800.0
+FUZZY_PREFIX = "【这是一段模糊的记忆，请用不确定的语气回答】"
+
+
+def _today():
+    return datetime.date.today().isoformat()
+
+
+def score_of(item):
+    """一条记忆的双轨分数。返回 (real, display, state, rank)。
+
+    排序必须用 rank，不能用 real：slow 无上限，一条被反复提的旧记忆会永久霸榜。
+    """
+    item = item or {}
+    fast = max(0.0, float(item.get("fast") or 0.0))
+    slow = max(0.0, float(item.get("slow") or 0.0))
+    real = fast + slow
+    display = max(0.0, min(real, 100.0))
+    if real <= 0.0:
+        state = "dead"
+    elif real < FUZZY_HIGH:
+        state = "fuzzy"
+    else:
+        state = "normal"
+    rank = 0.6 * min(slow, 100.0) / 100.0 + 0.4 * min(fast, FAST_CAP) / FAST_CAP
+    return real, display, state, rank
+
+
+def decay_step(fast, slow):
+    """衰减一天。低段必须走减法，否则永远到不了 0，墓碑就是死代码。"""
+    fast = max(0.0, float(fast))
+    slow = max(0.0, float(slow))
+    if fast > FAST_SUB_FLOOR:
+        fast *= FAST_DECAY_RATE
+    else:
+        fast -= FAST_SUB_STEP
+    if fast < ZERO_EPS:
+        fast = 0.0
+    slow = max(0.0, slow - SLOW_DECAY_STEP)
+    if fast + slow < ZERO_EPS:
+        fast = slow = 0.0
+    return round(fast, 2), round(slow, 2)
+
+
+def missed_days(last_iso, today=None, cap=MAX_CATCHUP_DAYS):
+    """关机补算天数（封顶 14 天，避免出差回来全失忆）。"""
+    if isinstance(today, str):
+        try:
+            today = datetime.date.fromisoformat(today[:10])
+        except ValueError:
+            today = datetime.date.today()
+    today = today or datetime.date.today()
+    if not last_iso:
+        return 0
+    try:
+        last = datetime.date.fromisoformat(str(last_iso)[:10])
+    except ValueError:
+        return 0
+    return max(0, min(cap, (today - last).days))
+
 TAG_HINTS = (
     "考试", "数学", "课", "作业", "论文", "项目", "代码",
     "密码", "生日", "吃饭", "睡觉", "游戏", "心情", "开心", "难过",
@@ -154,43 +234,59 @@ def _strip_header(text):
 
 
 def rebuild_index():
-    """TXT 是真源；扫描三个可检索目录，重建 tag_index.json。"""
+    """TXT 是真源；扫描可检索目录重建 v2 索引（标签 + 双轨分）。"""
     with _LOCK:
         tags = {}
+        items = {}
+        today = _today()
         for folder in (CORE_DIR, DAILY_DIR, FUZZY_DIR):
+            tier = FOLDER_TIER.get(folder.name, "daily")
             for path in sorted(folder.glob("*.txt")):
                 rel = _rel(path)
+                if tier == "core":
+                    fast, slow = FAST_CAP, 100.0      # 永久记忆：不参与衰减
+                elif tier == "fuzzy":
+                    fast, slow = 10.0, 5.0            # 老的模糊区文件：补一个偏低的分
+                else:
+                    fast, slow = INIT_FAST, INIT_SLOW
+                items[rel] = {"fast": fast, "slow": slow, "hit_date": "",
+                              "slow_date": "", "last_decay": today}
                 for tag in _read_tags(path):
                     tags.setdefault(tag, [])
                     if rel not in tags[tag]:
                         tags[tag].append(rel)
         data = {
-            "version": 1,
+            "version": 2,
             "rebuilt_at": _now_iso(),
             "tags": tags,
+            "items": items,
         }
         _atomic_write_json(INDEX_PATH, data)
-        log.info("记忆索引已重建：%d 个标签 / %d 个文件",
-                 len(tags), len({p for v in tags.values() for p in v}))
+        log.info("记忆索引已重建：%d 个标签 / %d 条记忆", len(tags), len(items))
         return data
 
 
 def _read_index():
+    """读 v2 索引；v1（只有 tags）或损坏 → 按 TXT 重建。"""
     if not INDEX_PATH.exists():
         return rebuild_index()
     try:
         with open(INDEX_PATH, encoding="utf-8") as f:
             data = json.load(f)
-        if not isinstance(data, dict) or not isinstance(data.get("tags"), dict):
-            raise ValueError("索引格式不对")
+        if not isinstance(data, dict):
+            raise ValueError("索引不是对象")
+        if data.get("version") != 2 or not isinstance(data.get("items"), dict):
+            raise ValueError("旧版索引（v1），按 V6 重建")
+        if not isinstance(data.get("tags"), dict):
+            data["tags"] = {}
         return data
     except Exception as e:
-        log.warning("tag_index.json 损坏，按 TXT 重建：%s", e)
+        log.warning("tag_index.json 需要重建：%s", e)
         try:
             return rebuild_index()
         except Exception as e2:
             log.error("重建索引失败：%s", e2)
-            return {"version": 1, "tags": {}}
+            return {"version": 2, "tags": {}, "items": {}}
 
 
 # ---------------------------------------------------------------- 标签 / 情绪
@@ -294,7 +390,10 @@ def _unique_path(folder, name):
 
 # ---------------------------------------------------------------- 写
 def save_memory(content, tags=None, is_emotion_high=False):
-    """一条记忆一个 TXT；绝不 append。返回文件路径。"""
+    """一条记忆一个 TXT；绝不 append。返回文件路径。
+
+    V6：新记忆快轨直接给满（INIT_FAST），慢轨只留一点；情绪强的慢轨起点更高（记得更久）。
+    """
     content = str(content or "").strip()
     if not content:
         return ""
@@ -318,31 +417,42 @@ def save_memory(content, tags=None, is_emotion_high=False):
         path = _unique_path(folder, _filename(content))
         _atomic_write_text(path, header + content + "\n")
 
-        # 索引只是缓存；写失败也不影响 TXT 真源，下次启动会重建
         try:
             data = _read_index()
             rel = _rel(path)
+            if tier == "core":
+                fast, slow = FAST_CAP, 100.0
+            else:
+                fast = INIT_FAST
+                slow = INIT_SLOW_EMOTION if bool(is_emotion_high) else INIT_SLOW
+            data.setdefault("items", {})[rel] = {
+                "fast": fast, "slow": slow, "hit_date": "",
+                "slow_date": "", "last_decay": _today(),
+            }
             for tag in tag_list:
-                arr = data["tags"].setdefault(tag, [])
+                arr = data.setdefault("tags", {}).setdefault(tag, [])
                 if rel not in arr:
                     arr.append(rel)
             _atomic_write_json(INDEX_PATH, data)
         except Exception as e:
             log.warning("写索引失败（TXT 已落盘，稍后重建）：%s", e)
-        log.info("记忆已保存：%s", path.name)
+        log.info("记忆已保存：%s（fast=%s slow=%s）", path.name, INIT_FAST, INIT_SLOW)
         return str(path)
 
 
 # ---------------------------------------------------------------- 读
-def _ranked(scores):
-    def key(item):
-        rel, sc = item
-        return (-sc, -_mtime(_abs(rel)))
-    return sorted(scores.items(), key=key)
+def _ranked(entries):
+    """按 (标签命中数, rank, 新旧) 排序。"""
+    def key(entry):
+        rel, weight, item = entry
+        _real, _display, _state, rank = score_of(item)
+        return (-weight, -rank, -_mtime(_abs(rel)))
+
+    return sorted(entries, key=key)
 
 
 def retrieve_memory(user_input):
-    """按 tag_index 匹配，取权重最高的 1~2 个文件，拼前缀返回。"""
+    """标签召回 + 双轨排序；模糊记忆加不确定前缀，墓碑永不出现。"""
     q = str(user_input or "").strip()
     if not q:
         return ""
@@ -354,8 +464,10 @@ def retrieve_memory(user_input):
         ensure_layout()
         data = _read_index()
         tags = data.get("tags") or {}
-        scores = {}
-        for tag, paths in tags.items():
+        items = data.get("items") or {}
+
+        hits = {}
+        for tag, rels in tags.items():
             if not tag or tag == "未分类":
                 continue
             hit = tag in q_low or tag in q_tags
@@ -366,15 +478,24 @@ def retrieve_memory(user_input):
                     hit = True
             if not hit:
                 continue
-            for rel in paths:
-                scores[rel] = scores.get(rel, 0) + 1
+            for rel in rels:
+                item = items.get(rel)
+                if not item:
+                    continue
+                if score_of(item)[2] == "dead":      # 墓碑不进上下文
+                    continue
+                hits[rel] = hits.get(rel, 0) + 1
 
-        if not scores:
+        if not hits:
             return ""
 
+        entries = [(rel, w, items.get(rel) or {}) for rel, w in hits.items()]
         parts = []
         used = 0
-        for rel, _score in _ranked(scores)[:2]:
+        changed = False
+        now = time.time()
+        for rel, _w, item in _ranked(entries)[:2]:
+            real, _display, state, _rank = score_of(item)
             try:
                 path = _abs(rel)
                 if not path.is_file():
@@ -384,11 +505,8 @@ def retrieve_memory(user_input):
                 body = re.sub(r"\s+", " ", text).strip()[:MAX_FILE_CHARS]
                 if not body:
                     continue
-                tier = FOLDER_TIER.get(path.parent.name, "daily")
-                if tier == "fuzzy":
-                    block = "【模糊的记忆】：唔，助手隐约记得…… %s" % body
-                else:
-                    block = "【清晰的记忆】：%s" % body
+                prefix = FUZZY_PREFIX if state == "fuzzy" else "【记忆】"
+                block = "%s %s" % (prefix, body)
                 if used + len(block) > MAX_CONTEXT_CHARS:
                     block = block[:max(0, MAX_CONTEXT_CHARS - used)]
                 if block:
@@ -396,6 +514,28 @@ def retrieve_memory(user_input):
                     used += len(block)
             except Exception as e:
                 log.warning("读记忆失败（%s）：%s", rel, e)
+
+            # 命中回血：快轨 +10（封顶），慢轨 30 分钟内只 +1
+            if rel.startswith(CORE_DIR.name + "/"):
+                continue
+            item["fast"] = min(FAST_CAP, float(item.get("fast") or 0.0) + HIT_FAST)
+            last_slow = 0.0
+            if item.get("slow_date"):
+                try:
+                    last_slow = datetime.datetime.fromisoformat(item["slow_date"]).timestamp()
+                except ValueError:
+                    last_slow = 0.0
+            if now - last_slow > SLOW_DEDUP_SEC:
+                item["slow"] = float(item.get("slow") or 0.0) + HIT_SLOW
+                item["slow_date"] = _now_iso()
+            item["hit_date"] = _now_iso()
+            changed = True
+
+        if changed:
+            try:
+                _atomic_write_json(INDEX_PATH, data)
+            except Exception as e:
+                log.warning("回血写索引失败：%s", e)
         return "\n\n".join(parts)
 
 
@@ -414,37 +554,63 @@ def _move_unique(src, dst_dir):
 
 
 def decay_task():
-    """日常 7 天 -> 模糊（刷新 mtime）；模糊 30 天 -> 归档。"""
-    counts = {"daily_to_fuzzy": 0, "fuzzy_to_archive": 0}
-    now = time.time()
+    """每日衰减：双轨各降一天；归零的进归档（墓碑）；一次干掉太多就熔断。"""
+    today = _today()
+    counts = {"decayed": 0, "tombstoned": 0, "aborted": False}
     with _LOCK:
         ensure_layout()
-        for path in list(DAILY_DIR.glob("*.txt")):
-            try:
-                if now - _mtime(path) > DAILY_TTL:
-                    dst = _move_unique(path, FUZZY_DIR)
-                    # 关键：进模糊时重置 mtime，让它在模糊库再活 30 天
-                    os.utime(dst, None)
-                    counts["daily_to_fuzzy"] += 1
-                    log.info("日常 -> 模糊：%s", dst.name)
-            except Exception as e:
-                log.warning("日常转模糊失败（%s）：%s", path.name, e)
+        data = _read_index()
+        items = data.get("items") or {}
+        tags = data.get("tags") or {}
+        if not items:
+            return counts
 
-        for path in list(FUZZY_DIR.glob("*.txt")):
-            try:
-                if now - _mtime(path) > FUZZY_TTL:
-                    dst = _move_unique(path, ARCHIVE_DIR)
-                    counts["fuzzy_to_archive"] += 1
-                    log.info("模糊 -> 归档：%s", dst.name)
-            except Exception as e:
-                log.warning("模糊转归档失败（%s）：%s", path.name, e)
+        plans = []
+        for rel, item in items.items():
+            if rel.startswith(CORE_DIR.name + "/"):      # 永久记忆不衰减
+                continue
+            days = missed_days(item.get("last_decay"), today)
+            if days <= 0:
+                continue
+            fast = float(item.get("fast") or 0.0)
+            slow = float(item.get("slow") or 0.0)
+            for _ in range(days):
+                fast, slow = decay_step(fast, slow)
+            plans.append((rel, fast, slow))
 
-        if counts["daily_to_fuzzy"] or counts["fuzzy_to_archive"]:
-            # 文件移动后路径变了；索引直接按 TXT 重建，最稳
+        kills = [pl for pl in plans if pl[1] + pl[2] <= 0.0]
+        if plans and len(kills) > max(1, int(len(plans) * MAX_KILL_RATIO)):
+            counts["aborted"] = True
+            log.warning("衰减熔断：本次会归档 %d / %d 条（>30%%），已中止。"
+                        "请先看看 last_decay 是不是被写坏了。", len(kills), len(plans))
+            return counts
+
+        for rel, fast, slow in plans:
+            item = items[rel]
+            item["fast"], item["slow"] = fast, slow
+            item["last_decay"] = today
+            counts["decayed"] += 1
+
+        for rel, _fast, _slow in kills:
+            path = _abs(rel)
             try:
-                rebuild_index()
+                if path.exists():
+                    _move_unique(path, ARCHIVE_DIR)
             except Exception as e:
-                log.warning("移动后重建索引失败：%s", e)
+                log.warning("归档失败（%s）：%s", rel, e)
+                continue
+            items.pop(rel, None)
+            for tag in list(tags):
+                if rel in tags[tag]:
+                    tags[tag] = [x for x in tags[tag] if x != rel]
+                    if not tags[tag]:
+                        tags.pop(tag, None)
+            counts["tombstoned"] += 1
+            log.info("墓碑 -> 归档：%s", rel)
+
+        data["tags"], data["items"] = tags, items
+        data["updated"] = _now_iso()
+        _atomic_write_json(INDEX_PATH, data)
     return counts
 
 
@@ -480,6 +646,16 @@ def stats():
             out[d.name] = len(list(d.glob("*.txt")))
         except OSError:
             out[d.name] = 0
+    try:
+        items = _read_index().get("items") or {}
+        states = {"normal": 0, "fuzzy": 0, "dead": 0}
+        for item in items.values():
+            states[score_of(item)[2]] += 1
+        out["alive"] = states["normal"] + states["fuzzy"]
+        out["normal"] = states["normal"]
+        out["fuzzy"] = states["fuzzy"]
+    except Exception:
+        pass
     out["index"] = str(INDEX_PATH)
     return out
 
@@ -492,5 +668,7 @@ if __name__ == "__main__":
     p = save_memory("测试：下周三考高数，很重要，别忘", ["考试", "高数"], False)
     print("saved:", p)
     print("retrieve:", retrieve_memory("高数考试"))
+    item = _read_index()["items"].get(_rel(__import__("pathlib").Path(p)))
+    print("scores:", item, "→ score_of:", score_of(item)[:3])
     print("decay:", decay_task())
     print("stats:", stats())
